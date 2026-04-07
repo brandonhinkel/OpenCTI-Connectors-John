@@ -2,12 +2,13 @@
 # requirements.txt — Flashpoint Ignite Connector
 # =============================================================================
 # Pin pycti to the exact instance version. Mismatches cause schema errors.
-# The instance is running OpenCTI 6.9.13 — pycti must match exactly.
+# The instance is running OpenCTI 7.260309.0 — pycti must match exactly.
 # After any OpenCTI platform upgrade, this pin must be updated to match.
-pycti==6.9.13
+pycti==7.260309.0
 
 # STIX 2.1 object construction and serialisation.
-stix2
+# Pinned to match pycti==7.260309.0's declared dependency.
+stix2~=3.0.1
 
 # HTTP client for Flashpoint Ignite API calls.
 requests

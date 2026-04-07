@@ -3,8 +3,8 @@
 OpenCTI external import connector for the Flashpoint Ignite threat intelligence platform.
 
 **Version:** 1.0.0  
-**Platform:** OpenCTI 6.9.13  
-**pycti:** 6.9.13  
+**Platform:** OpenCTI 7.260309.0  
+**pycti:** 7.260309.0  
 **Status:** Production-ready (Compromised Credentials dataset stubbed — see Known Limitations)
 
 ---
@@ -187,7 +187,7 @@ All variables can be set as environment variables (Docker, recommended) or in `c
 
 ### Prerequisites
 
-1. OpenCTI 6.9.13 running via Docker Compose at `~/opencti-docker/`
+1. OpenCTI 7.260309.0 running via Docker Compose at `~/opencti-docker/`
 2. The Filigran upstream Flashpoint connector (`external-import/flashpoint`) stopped and removed from `docker-compose.override.yml`
 3. A Flashpoint Ignite API key with the required permissions
 4. `FLASHPOINT_ORG_DOMAINS` configured if alert bifurcation is needed
@@ -336,7 +336,7 @@ The `publishes` relationship type between Channel SDOs and Text observables is e
 
 ### Persona Observable Availability
 
-`CustomObservablePersona` is imported from pycti for Communities persona creation. This custom observable type was in a pending PR state in the Filigran codebase as of the time this connector was written. If it is not available in pycti==6.9.13, Persona creation will fail with a logged warning per result. The Text observable will receive a floor relationship to the Flashpoint identity instead. The rest of the Communities result (Channel, Text, relationships) is unaffected.
+`CustomObservablePersona` is imported from pycti for Communities persona creation. This custom observable type was in a pending PR state in the Filigran codebase as of the time this connector was written. If it is not available in pycti==7.260309.0, Persona creation will fail with a logged warning per result. The Text observable will receive a floor relationship to the Flashpoint identity instead. The rest of the Communities result (Channel, Text, relationships) is unaffected.
 
 ### Knowledge Graph Resolution Quality
 
@@ -394,7 +394,7 @@ Remove it from `docker-compose.override.yml`. Do not run both simultaneously —
 
 | Package | Version | Purpose |
 |---|---|---|
-| pycti | 6.9.13 | OpenCTI platform client — must match instance version exactly |
+| pycti | 7.260309.0 | OpenCTI platform client — must match instance version exactly |
 | stix2 | latest | STIX 2.1 object construction and serialisation |
 | requests | latest | Flashpoint Ignite API HTTP client |
 | pyyaml | latest | config.yml parsing |
