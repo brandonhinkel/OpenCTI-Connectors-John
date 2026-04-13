@@ -19,8 +19,9 @@
 #   3. Every Observable that has no resolvable entity relationship is linked
 #      to the Flashpoint author identity via _floor_relation(). The floor
 #      relationship is the minimum required by the data model.
-#   4. All containers use report_types=["activity-roundup"] universally.
-#      There is no per-dataset Report type variation.
+#   4. Report types differ by dataset:
+#        Finished intelligence → ["threat-report"]
+#        Alert/communities batch Reports → ["observed-data"]
 #
 # DEFAULT TLP: TLP:AMBER+STRICT for all objects from all datasets.
 # Dark web community content and credential data are not public; applying
@@ -40,7 +41,9 @@
 # =============================================================================
 
 import base64 as _b64
+import html as _html
 import mimetypes
+import re as _re
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -62,6 +65,20 @@ from pycti import (
     ThreatActorIndividual,
     Tool,
 )
+
+# CustomObservableText and CustomObservablePersona were added in pycti 6.x.
+# Import once here so methods don't pay the import cost per call. If the
+# installed pycti version does not have them, the affected observables are
+# skipped with a warning rather than crashing the connector.
+try:
+    from pycti import CustomObservableText
+except ImportError:
+    CustomObservableText = None  # type: ignore[assignment,misc]
+
+try:
+    from pycti import CustomObservablePersona
+except ImportError:
+    CustomObservablePersona = None  # type: ignore[assignment,misc]
 
 # =============================================================================
 # Module-level constants
@@ -89,6 +106,71 @@ _FP_HIGHLIGHT_CLOSE = "</x-fp-highlight>"
 def _strip_highlight(s: str) -> str:
     """Remove Flashpoint search-highlight markup from a string."""
     return s.replace(_FP_HIGHLIGHT_OPEN, "").replace(_FP_HIGHLIGHT_CLOSE, "")
+
+
+def _excerpt_highlight(text: str, context: int = 60) -> str:
+    """
+    Extract a plain-text excerpt from text containing <mark>…</mark> spans,
+    preserving ~`context` chars of surrounding text around each match.
+    Non-adjacent windows are joined with ' … '.
+
+    Used to produce short observable values from alert highlight_text without
+    losing the matched context. <mark> tags are stripped in the output.
+
+    :param text: raw text possibly containing <mark>…</mark> markup
+    :param context: chars of context before/after each marked span
+    :return: plain-text excerpt (~120 chars per window)
+    """
+    if not text:
+        return ""
+
+    # Replace <mark>/<mark> with single private-use sentinels, strip remaining
+    # HTML tags, then scan character-by-character to record where each marked
+    # span falls in the final plain text.
+    _OPEN = "\x02"
+    _CLOSE = "\x03"
+    tagged = text.replace("<mark>", _OPEN).replace("</mark>", _CLOSE)
+    tagged = _re.sub(r"<[^>]+>", "", tagged)  # strip remaining tags
+
+    plain_chars: list = []
+    mark_ranges: list = []
+    span_start = None
+
+    for ch in tagged:
+        if ch == _OPEN:
+            span_start = len(plain_chars)
+        elif ch == _CLOSE:
+            if span_start is not None:
+                mark_ranges.append((span_start, len(plain_chars)))
+                span_start = None
+        else:
+            plain_chars.append(ch)
+
+    plain = "".join(plain_chars)
+
+    if not mark_ranges:
+        return plain[:120] + ("…" if len(plain) > 120 else "")
+
+    # Build context windows and merge overlapping ones.
+    windows: list = []
+    for ms, me in mark_ranges:
+        ws = max(0, ms - context)
+        we = min(len(plain), me + context)
+        if windows and ws <= windows[-1][1]:
+            windows[-1][1] = max(windows[-1][1], we)
+        else:
+            windows.append([ws, we])
+
+    parts = []
+    for ws, we in windows:
+        chunk = plain[ws:we]
+        if ws > 0:
+            chunk = "…" + chunk
+        if we < len(plain):
+            chunk = chunk + "…"
+        parts.append(chunk)
+
+    return " … ".join(parts)
 
 
 # =============================================================================
@@ -679,7 +761,7 @@ class ConverterToStix:
         Convert a Flashpoint finished intelligence report dict into a list
         of STIX objects for bundle creation.
 
-        CONTAINER: stix2.Report with report_types=["activity-roundup"]
+        CONTAINER: stix2.Report with report_types=["threat-report"]
         CONTAINMENT: All knowledge graph objects resolved from tags and actors
                      are members of the Report via object_refs.
 
@@ -762,8 +844,10 @@ class ConverterToStix:
             # re-fetched (e.g. because it was updated on Flashpoint).
             id=Report.generate_id(report["title"], report["posted_at"]),
             name=report["title"],
-            # All containers in this connector use activity-roundup.
-            report_types=["activity-roundup"],
+            # Finished intelligence reports use threat-report so they can
+            # be scoped separately from raw alert/communities batch Reports
+            # in OpenCTI retention policies.
+            report_types=["threat-report"],
             published=published,
             # summary is the human-readable abstract. body is the full text
             # stored separately in x_opencti_content.
@@ -830,6 +914,7 @@ class ConverterToStix:
         objects = [self.marking]
 
         alert_id = alert.get("alert_id", "unknown")
+        alert_reason = alert.get("alert_reason") or ""
         channel_name = alert.get("channel_name") or alert.get("channel_type", "")
         channel_type = alert.get("channel_type", "unknown")
         channel_aliases = alert.get("channel_aliases") or []
@@ -840,45 +925,55 @@ class ConverterToStix:
         flashpoint_url = alert.get("flashpoint_url") or ""
 
         # ── Text Observable ───────────────────────────────────────────────────
-        # The alert highlight_text is the post content or code snippet that
-        # triggered the alert rule. Stored as a Text Observable so it is
-        # accessible for analysis alongside the Channel context.
-        # Observable description contains only technical provenance — the
-        # actual threat behaviour (why this text is relevant) belongs in
-        # the relationship description.
+        # value: short excerpt centred on <mark> spans — readable as a title
+        #        in the OpenCTI entity list.
+        # x_opencti_description: full highlight_text so analysts can read the
+        #        complete matched content from the observable's Description tab.
+        # x_opencti_labels: alert rule name for filtering/searching by rule.
         text_obs = None
         if highlight_text:
-            try:
-                from pycti import CustomObservableText
-                text_obs = CustomObservableText(
-                    value=highlight_text,
-                    object_marking_refs=[self.marking.get("id")],
-                    custom_properties={
-                        # Technical provenance only — not threat behaviour.
-                        "x_opencti_description": (
-                            f"Alert highlight text from {channel_type} "
-                            f"source. Alert ID: {alert_id}. "
-                            f"Captured: {created_at}."
-                        ),
-                        "x_opencti_score": confidence,
-                        "created_by_ref": self.author_id,
-                        "external_references": (
-                            [
-                                stix2.ExternalReference(
-                                    source_name="Flashpoint",
-                                    url=flashpoint_url,
-                                )
-                            ]
-                            if flashpoint_url
-                            else []
-                        ),
-                    },
-                )
-                objects.append(text_obs)
-            except Exception as exc:
+            if CustomObservableText is None:
                 self.helper.connector_logger.warning(
-                    f"[CONVERTER] Text observable failed for alert {alert_id}: {exc}"
+                    f"[CONVERTER] Text observable skipped for alert {alert_id}: "
+                    f"CustomObservableText not available — check pycti==7.260309.0."
                 )
+            else:
+                try:
+                    excerpt = _excerpt_highlight(highlight_text)
+                    labels = (
+                        [f"rule:{alert_reason.lower()}"] if alert_reason else []
+                    )
+                    text_obs = CustomObservableText(
+                        value=excerpt or highlight_text[:120],
+                        object_marking_refs=[self.marking.get("id")],
+                        custom_properties={
+                            # Full alert content visible in the Description tab.
+                            "x_opencti_description": (
+                                f"Alert highlight text from {channel_type} "
+                                f"source. Alert ID: {alert_id}. "
+                                f"Captured: {created_at}.\n\n"
+                                f"{highlight_text}"
+                            ),
+                            "x_opencti_score": confidence,
+                            "x_opencti_labels": labels,
+                            "created_by_ref": self.author_id,
+                            "external_references": (
+                                [
+                                    stix2.ExternalReference(
+                                        source_name="Flashpoint",
+                                        url=flashpoint_url,
+                                    )
+                                ]
+                                if flashpoint_url
+                                else []
+                            ),
+                        },
+                    )
+                    objects.append(text_obs)
+                except Exception as exc:
+                    self.helper.connector_logger.warning(
+                        f"[CONVERTER] Text observable failed for alert {alert_id}: {exc}"
+                    )
 
         if not create_related_entities:
             # Minimal mode — apply floor relationship and return.
@@ -1124,41 +1219,47 @@ class ConverterToStix:
 
         # ── Text Observable ───────────────────────────────────────────────────
         if highlight_text:
-            try:
-                from pycti import CustomObservableText
-                text_obs = CustomObservableText(
-                    value=highlight_text,
-                    object_marking_refs=[self.marking.get("id")],
-                    custom_properties={
-                        "x_opencti_description": (
-                            f"Alert highlight text from Flashpoint credential "
-                            f"alert {alert_id}. Source: {alert_source}."
-                        ),
-                        "x_opencti_score": confidence,
-                        "created_by_ref": self.author_id,
-                    },
-                )
-                objects.append(text_obs)
-
-                # Link Text to Incident — the text is evidence of the exposure.
-                rel = self.create_relation(
-                    source_id=text_obs.id,
-                    target_id=stix_incident.id,
-                    relation="related-to",
-                    description=(
-                        f"Alert highlight text is the content that triggered "
-                        f"the Flashpoint credential alert {alert_id} "
-                        f"from source: {alert_source}."
-                    ),
-                    confidence=confidence,
-                )
-                if rel:
-                    objects.append(rel)
-            except Exception as exc:
+            if CustomObservableText is None:
                 self.helper.connector_logger.warning(
-                    f"[CONVERTER] Text observable for credential alert "
-                    f"{alert_id}: {exc}"
+                    f"[CONVERTER] Text observable skipped for credential alert "
+                    f"{alert_id}: CustomObservableText not available — "
+                    f"check pycti==7.260309.0."
                 )
+            else:
+                try:
+                    text_obs = CustomObservableText(
+                        value=highlight_text,
+                        object_marking_refs=[self.marking.get("id")],
+                        custom_properties={
+                            "x_opencti_description": (
+                                f"Alert highlight text from Flashpoint credential "
+                                f"alert {alert_id}. Source: {alert_source}."
+                            ),
+                            "x_opencti_score": confidence,
+                            "created_by_ref": self.author_id,
+                        },
+                    )
+                    objects.append(text_obs)
+
+                    # Link Text to Incident — the text is evidence of the exposure.
+                    rel = self.create_relation(
+                        source_id=text_obs.id,
+                        target_id=stix_incident.id,
+                        relation="related-to",
+                        description=(
+                            f"Alert highlight text is the content that triggered "
+                            f"the Flashpoint credential alert {alert_id} "
+                            f"from source: {alert_source}."
+                        ),
+                        confidence=confidence,
+                    )
+                    if rel:
+                        objects.append(rel)
+                except Exception as exc:
+                    self.helper.connector_logger.warning(
+                        f"[CONVERTER] Text observable for credential alert "
+                        f"{alert_id}: {exc}"
+                    )
 
         # ── URL Observable ────────────────────────────────────────────────────
         # The Flashpoint platform URL links back to the specific alert in
@@ -1287,69 +1388,77 @@ class ConverterToStix:
         # is the digital mask, not the person behind it.
         persona_obj = None
         if handle:
-            try:
-                from pycti import CustomObservablePersona
-                persona_obj = CustomObservablePersona(
-                    name=handle,
-                    aliases=aliases,
-                    object_marking_refs=[self.marking.get("id")],
-                    custom_properties={
-                        # Technical provenance only in description.
-                        "x_opencti_description": (
-                            f"Dark web forum persona observed on {site} "
-                            f"via Flashpoint Communities query '{query}'. "
-                            f"Post date: {post_date}. Post ID: {doc_id}."
-                        ),
-                        "x_opencti_score": confidence,
-                        "created_by_ref": self.author_id,
-                        "external_references": [
-                            stix2.ExternalReference(
-                                source_name="Flashpoint",
-                                url=fp_url,
-                            )
-                        ],
-                    },
-                )
-                objects.append(persona_obj)
-            except Exception as exc:
+            if CustomObservablePersona is None:
                 self.helper.connector_logger.warning(
-                    f"[CONVERTER] Persona creation for doc {doc_id}: {exc}. "
-                    f"CustomObservablePersona may not be available in this "
-                    f"pycti version — check pycti==6.9.13."
+                    f"[CONVERTER] Persona creation skipped for doc {doc_id}: "
+                    f"CustomObservablePersona not available — check pycti==7.260309.0."
                 )
+            else:
+                try:
+                    persona_obj = CustomObservablePersona(
+                        name=handle,
+                        aliases=aliases,
+                        object_marking_refs=[self.marking.get("id")],
+                        custom_properties={
+                            # Technical provenance only in description.
+                            "x_opencti_description": (
+                                f"Dark web forum persona observed on {site} "
+                                f"via Flashpoint Communities query '{query}'. "
+                                f"Post date: {post_date}. Post ID: {doc_id}."
+                            ),
+                            "x_opencti_score": confidence,
+                            "created_by_ref": self.author_id,
+                            "external_references": [
+                                stix2.ExternalReference(
+                                    source_name="Flashpoint",
+                                    url=fp_url,
+                                )
+                            ],
+                        },
+                    )
+                    objects.append(persona_obj)
+                except Exception as exc:
+                    self.helper.connector_logger.warning(
+                        f"[CONVERTER] Persona creation for doc {doc_id}: {exc}."
+                    )
 
         # ── Text Observable ───────────────────────────────────────────────────
         # The raw post content. Value field holds the actual text.
         # Description holds only provenance metadata.
         text_obs = None
         if message:
-            try:
-                from pycti import CustomObservableText
-                text_obs = CustomObservableText(
-                    value=message,
-                    object_marking_refs=[self.marking.get("id")],
-                    custom_properties={
-                        "x_opencti_description": (
-                            f"Dark web forum post content captured by "
-                            f"Flashpoint Communities search. "
-                            f"Query: '{query}', site: {site}. "
-                            f"Post ID: {doc_id}."
-                        ),
-                        "x_opencti_score": confidence,
-                        "created_by_ref": self.author_id,
-                        "external_references": [
-                            stix2.ExternalReference(
-                                source_name="Flashpoint",
-                                url=fp_url,
-                            )
-                        ],
-                    },
-                )
-                objects.append(text_obs)
-            except Exception as exc:
+            if CustomObservableText is None:
                 self.helper.connector_logger.warning(
-                    f"[CONVERTER] Text observable for doc {doc_id}: {exc}"
+                    f"[CONVERTER] Text observable skipped for doc {doc_id}: "
+                    f"CustomObservableText not available — check pycti==7.260309.0."
                 )
+            else:
+                try:
+                    text_obs = CustomObservableText(
+                        value=message,
+                        object_marking_refs=[self.marking.get("id")],
+                        custom_properties={
+                            "x_opencti_description": (
+                                f"Dark web forum post content captured by "
+                                f"Flashpoint Communities search. "
+                                f"Query: '{query}', site: {site}. "
+                                f"Post ID: {doc_id}."
+                            ),
+                            "x_opencti_score": confidence,
+                            "created_by_ref": self.author_id,
+                            "external_references": [
+                                stix2.ExternalReference(
+                                    source_name="Flashpoint",
+                                    url=fp_url,
+                                )
+                            ],
+                        },
+                    )
+                    objects.append(text_obs)
+                except Exception as exc:
+                    self.helper.connector_logger.warning(
+                        f"[CONVERTER] Text observable for doc {doc_id}: {exc}"
+                    )
 
         # ── Relationships ─────────────────────────────────────────────────────
 
@@ -1483,6 +1592,9 @@ class ConverterToStix:
         member_objects: list,
         confidence: int,
         extra_external_refs: Optional[list] = None,
+        report_types: Optional[list] = None,
+        description: Optional[str] = None,
+        content: Optional[str] = None,
     ) -> stix2.Report:
         """
         Build a daily batch Report container from accumulated member objects.
@@ -1518,6 +1630,11 @@ class ConverterToStix:
         :param confidence: confidence score for the Report
         :param extra_external_refs: additional stix2.ExternalReference objects
                to include (e.g. per-contributing-alert Flashpoint URLs)
+        :param report_types: STIX report_types list; defaults to ["observed-data"]
+        :param description: plain-text description for the Report; defaults to a
+               generic batch description
+        :param content: HTML string for x_opencti_content (the Content tab); if
+               None, the Content tab is left empty
         :return: stix2.Report object ready for bundle inclusion
         """
         # Published date is midnight UTC on the batch date.
@@ -1556,22 +1673,136 @@ class ConverterToStix:
         if extra_external_refs:
             ext_refs.extend(extra_external_refs)
 
+        effective_report_types = report_types or ["observed-data"]
+        effective_description = description or (
+            f"Flashpoint intelligence batch for {date_str}. "
+            f"Automatically generated by the Flashpoint connector."
+        )
+
+        custom_props: dict = {"x_opencti_score": confidence}
+        if content:
+            custom_props["x_opencti_content"] = content
+
         return stix2.Report(
             id=Report.generate_id(name, published.isoformat()),
             name=name,
-            report_types=["activity-roundup"],
+            report_types=effective_report_types,
             published=published,
-            description=(
-                f"Flashpoint intelligence batch for {date_str}. "
-                f"Automatically generated by the Flashpoint connector."
-            ),
+            description=effective_description,
             created_by_ref=self.author_id,
             object_marking_refs=[self.marking.get("id")],
             object_refs=object_ref_ids,
             external_references=ext_refs,
             allow_custom=True,
-            custom_properties={"x_opencti_score": confidence},
+            custom_properties=custom_props,
         )
+
+    # =========================================================================
+    # HTML analyst summary
+    # =========================================================================
+
+    @staticmethod
+    def build_alert_report_html(
+        date_str: str,
+        alerts: list,
+        existing_content: str = "",
+    ) -> str:
+        """
+        Generate an HTML analyst summary for a batch of keyword-match alerts.
+
+        OUTPUT STRUCTURE:
+          <h2>Run: {timestamp} — {N} alerts</h2>
+          <h3>{rule_name}</h3>
+          <pre><code>{rule_logic}</code></pre>   ← only if alert_logic present
+          <table>Time | Source | Channel | Author | Highlight | Link</table>
+          ... (one <h3>/table block per distinct alert_reason) ...
+
+        APPEND MODEL:
+        If existing_content is provided (read from the Report's x_opencti_content
+        before this run), the new section is prepended above the existing content
+        separated by <hr>. This produces a chronological log with the most recent
+        run at the top.
+
+        :param date_str: YYYY-MM-DD date for the batch
+        :param alerts: list of processed alert dicts for this date bucket
+        :param existing_content: prior x_opencti_content for this Report, if any
+        :return: combined HTML string ready for x_opencti_content
+        """
+        now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        n = len(alerts)
+
+        # Group alerts by rule name, preserving insertion order.
+        groups: dict = {}
+        for alert in alerts:
+            reason = alert.get("alert_reason") or "Unknown Rule"
+            groups.setdefault(reason, []).append(alert)
+
+        # ── Section header ────────────────────────────────────────────────────
+        section = (
+            f'<h2>Run: {_html.escape(now_utc)} — '
+            f'{n} alert{"s" if n != 1 else ""}</h2>\n'
+        )
+
+        # ── One block per alert rule ──────────────────────────────────────────
+        for rule_name, rule_alerts in groups.items():
+            section += f'<h3>{_html.escape(rule_name)}</h3>\n'
+
+            # Show rule logic (search query) if available so analysts can see
+            # why the rule fired without leaving the Content tab.
+            rule_logic = rule_alerts[0].get("alert_logic") or ""
+            if rule_logic:
+                section += (
+                    f'<pre><code>{_html.escape(rule_logic)}</code></pre>\n'
+                )
+
+            section += (
+                '<table border="1" cellpadding="4" cellspacing="0">\n'
+                "<thead><tr>"
+                "<th>Time (UTC)</th>"
+                "<th>Source</th>"
+                "<th>Channel</th>"
+                "<th>Author</th>"
+                "<th>Highlight</th>"
+                "<th>Link</th>"
+                "</tr></thead>\n"
+                "<tbody>\n"
+            )
+
+            for alert in rule_alerts:
+                created = _html.escape(alert.get("created_at") or "")
+                source = _html.escape(alert.get("alert_source") or "")
+                channel = _html.escape(
+                    alert.get("channel_name") or alert.get("channel_type") or ""
+                )
+                author = _html.escape(alert.get("author") or "")
+                highlight = alert.get("highlight_text") or ""
+                # Media alerts have no text — display a placeholder instead.
+                if highlight:
+                    excerpt = _html.escape(_excerpt_highlight(highlight))
+                else:
+                    excerpt = "<em>[media attachment]</em>"
+                url = alert.get("flashpoint_url") or ""
+                link_cell = (
+                    f'<a href="{_html.escape(url)}" target="_blank">&#x2197;</a>'
+                    if url
+                    else ""
+                )
+                section += (
+                    "<tr>"
+                    f"<td>{created}</td>"
+                    f"<td>{source}</td>"
+                    f"<td>{channel}</td>"
+                    f"<td>{author}</td>"
+                    f"<td>{excerpt}</td>"
+                    f"<td>{link_cell}</td>"
+                    "</tr>\n"
+                )
+
+            section += "</tbody>\n</table>\n"
+
+        if existing_content:
+            return section + "\n<hr>\n\n" + existing_content
+        return section
 
     # =========================================================================
     # Internal helpers
@@ -1644,6 +1875,10 @@ class ConverterToStix:
         :param alert: processed alert dict
         :return: Markdown string
         """
+        logic = alert.get("alert_logic") or ""
+        logic_section = (
+            f"\n**Rule Logic:**\n```\n{logic}\n```\n" if logic else ""
+        )
         return (
             f"### Metadata\n"
             f"- **Alert ID**: {alert.get('alert_id')}\n"
@@ -1654,6 +1889,7 @@ class ConverterToStix:
             f"- **Status**: {alert.get('alert_status')}\n"
             f"- **Source**: {alert.get('alert_source')}\n"
             f"- **Rule**: {alert.get('alert_reason')}\n"
+            f"{logic_section}"
             f"- **URL**: {alert.get('flashpoint_url')}\n\n"
             f"### Post\n"
             f"```\n"

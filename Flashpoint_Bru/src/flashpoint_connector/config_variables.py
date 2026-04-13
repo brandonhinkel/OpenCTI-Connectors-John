@@ -59,11 +59,11 @@ class ConfigConnector:
         will then be read from environment variables instead.
         """
         config_file_path = Path(__file__).parents[1].joinpath("config.yml")
-        config = (
-            yaml.load(open(config_file_path), Loader=yaml.FullLoader)
-            if os.path.isfile(config_file_path)
-            else {}
-        )
+        if os.path.isfile(config_file_path):
+            with open(config_file_path) as f:
+                config = yaml.load(f, Loader=yaml.FullLoader)
+        else:
+            config = {}
         return config
 
     def _initialize_configurations(self) -> None:
@@ -160,7 +160,7 @@ class ConfigConnector:
             "FLASHPOINT_IMPORT_CREDENTIALS",
             ["flashpoint", "import_credentials"],
             self.load,
-            default=True,
+            default=False,
         )
 
         # ── Communities configuration ─────────────────────────────────────────

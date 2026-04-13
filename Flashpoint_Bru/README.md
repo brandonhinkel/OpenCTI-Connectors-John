@@ -214,6 +214,7 @@ connector-flashpoint:
     - OPENCTI_URL=http://opencti:8080
     - OPENCTI_TOKEN=          # connector service account token
     - CONNECTOR_ID=           # generate: python3 -c "import uuid; print(uuid.uuid4())"
+    - CONNECTOR_TYPE=EXTERNAL_IMPORT
     - CONNECTOR_NAME=Flashpoint
     - CONNECTOR_LOG_LEVEL=info
     - CONNECTOR_DURATION_PERIOD=PT6H

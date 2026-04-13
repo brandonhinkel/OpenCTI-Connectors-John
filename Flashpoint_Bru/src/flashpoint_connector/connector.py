@@ -64,8 +64,9 @@ import sys
 from typing import Optional
 
 import pytz
+import stix2
 from dateutil.parser import parse
-from pycti import OpenCTIConnectorHelper
+from pycti import OpenCTIConnectorHelper, Report
 
 from .client_api import ConnectorClient
 from .config_variables import ConfigConnector
@@ -428,6 +429,7 @@ because the OpenCTI API requires individual calls per object. This is
             "alert_status": alert.get("status") or "None",
             "alert_source": source,
             "alert_reason": (alert.get("reason") or {}).get("name") or "",
+            "alert_logic": (alert.get("reason") or {}).get("text") or "",
             "highlight_text": alert.get("highlight_text") or "",
             "document_id": resource.get("id"),
             # Default Flashpoint platform URL — overridden for data_exposure.
@@ -678,9 +680,12 @@ because the OpenCTI API requires individual calls per object. This is
             )
 
             # Bucket structure for keyword-match daily batch Reports.
-            # {date_str: {"objects": [stix_objects], "ext_refs": [ExternalReference]}}
-            # ext_refs accumulates per-alert Flashpoint URLs so the batch
-            # Report has a complete list of contributing alert URLs.
+            # {date_str: {
+            #   "objects":   [stix_objects],        — STIX member objects
+            #   "ext_refs":  [ExternalReference],   — per-alert Flashpoint URLs
+            #   "seen_urls": set(),                 — dedup guard for ext_refs
+            #   "alerts":    [processed_dict],      — raw processed alerts for HTML
+            # }}
             keyword_buckets: dict = {}
 
             ir_count = 0          # Count of alerts routed to IR
@@ -755,6 +760,8 @@ because the OpenCTI API requires individual calls per object. This is
                             keyword_buckets[date_str] = {
                                 "objects": [],
                                 "ext_refs": [],
+                                "seen_urls": set(),
+                                "alerts": [],
                             }
 
                         # Convert alert to member objects (no container).
@@ -763,17 +770,21 @@ because the OpenCTI API requires individual calls per object. This is
                         )
                         keyword_buckets[date_str]["objects"].extend(objects)
 
-                        # Accumulate per-alert external reference for the batch
-                        # Report. This allows analysts to navigate from the
-                        # Report directly to individual alerts in Flashpoint.
-                        if processed["flashpoint_url"]:
-                            import stix2 as _stix2
+                        # Accumulate per-alert external reference, skipping
+                        # duplicates (same URL from multiple alerts in one day).
+                        url = processed["flashpoint_url"]
+                        if url and url not in keyword_buckets[date_str]["seen_urls"]:
+                            keyword_buckets[date_str]["seen_urls"].add(url)
                             keyword_buckets[date_str]["ext_refs"].append(
-                                _stix2.ExternalReference(
+                                stix2.ExternalReference(
                                     source_name="Flashpoint",
-                                    url=processed["flashpoint_url"],
+                                    url=url,
                                 )
                             )
+
+                        # Accumulate processed alert for HTML summary generation.
+                        keyword_buckets[date_str]["alerts"].append(processed)
+
                         keyword_count += 1
 
                     except Exception as exc:
@@ -787,22 +798,76 @@ because the OpenCTI API requires individual calls per object. This is
             for date_str, bucket in sorted(keyword_buckets.items()):
                 try:
                     report_name = f"Flashpoint Alerts — {date_str}"
+                    alerts = bucket["alerts"]
+                    n_alerts = len(alerts)
+
+                    # Deduplicate member objects by STIX ID (preserving first
+                    # occurrence). Channel/Persona SDOs have deterministic IDs
+                    # and will appear multiple times when shared across alerts.
+                    seen: dict = {}
+                    for obj in bucket["objects"]:
+                        obj_id = getattr(obj, "id", None)
+                        if obj_id and obj_id not in seen:
+                            seen[obj_id] = obj
+                    unique_objects = list(seen.values())
+
+                    # Read existing Content tab HTML so this run can prepend
+                    # its section above prior runs (append model).
+                    # The Report STIX ID is deterministic from name + published
+                    # date, so we can look it up without a name search.
+                    existing_content = ""
+                    try:
+                        _published = datetime.datetime(
+                            *map(int, date_str.split("-")),
+                            tzinfo=datetime.timezone.utc,
+                        )
+                        report_stix_id = Report.generate_id(
+                            report_name, _published.isoformat()
+                        )
+                        existing = self.helper.api.report.read(
+                            id=report_stix_id
+                        )
+                        existing_content = (existing or {}).get(
+                            "x_opencti_content"
+                        ) or ""
+                    except Exception as exc:
+                        self.helper.connector_logger.debug(
+                            f"[ALERTS] Could not read existing Report content "
+                            f"for {date_str}: {exc}"
+                        )
+
+                    # Generate HTML summary and description for this run.
+                    html_content = self.converter.build_alert_report_html(
+                        date_str=date_str,
+                        alerts=alerts,
+                        existing_content=existing_content,
+                    )
+                    description = (
+                        f"{n_alerts} keyword-match alert"
+                        f"{'s' if n_alerts != 1 else ''} from Flashpoint "
+                        f"Ignite for {date_str}."
+                    )
+
                     report_obj = self.converter.build_daily_report(
                         name=report_name,
                         date_str=date_str,
-                        member_objects=bucket["objects"],
+                        member_objects=unique_objects,
                         confidence=self.config.alert_confidence,
                         extra_external_refs=bucket["ext_refs"],
+                        report_types=["observed-data"],
+                        description=description,
+                        content=html_content,
                     )
                     # Include marking + all member objects + Report in one bundle.
                     all_objects = (
                         [self.converter.marking]
-                        + bucket["objects"]
+                        + unique_objects
                         + [report_obj]
                     )
                     self._send_bundle(work_id, all_objects)
                     self.helper.connector_logger.info(
-                        f"[ALERTS] Sent keyword batch Report: {report_name}"
+                        f"[ALERTS] Sent keyword batch Report: {report_name} "
+                        f"({n_alerts} alerts)"
                     )
                 except Exception as exc:
                     self.helper.connector_logger.error(
@@ -857,7 +922,7 @@ because the OpenCTI API requires individual calls per object. This is
 
         PERSONA NOTE:
         CustomObservablePersona is imported inside the converter. If this
-        custom observable type is not available in pycti==6.9.13, Persona
+        custom observable type is not available in pycti==7.260309.0, Persona
         creation will fail with a warning per-result, and the Text observable
         will receive a floor relationship to the Flashpoint identity instead.
         """
@@ -933,14 +998,26 @@ because the OpenCTI API requires individual calls per object. This is
                         report_name = (
                             f"Flashpoint Communities [{safe_query}] — {date_str}"
                         )
+
+                        # Deduplicate member objects by STIX ID.
+                        seen: dict = {}
+                        for obj in objects:
+                            obj_id = getattr(obj, "id", None)
+                            if obj_id and obj_id not in seen:
+                                seen[obj_id] = obj
+                        unique_objects = list(seen.values())
+
                         report_obj = self.converter.build_daily_report(
                             name=report_name,
                             date_str=date_str,
-                            member_objects=objects,
+                            member_objects=unique_objects,
                             confidence=self.config.communities_confidence,
+                            report_types=["observed-data"],
                         )
                         all_objects = (
-                            [self.converter.marking] + objects + [report_obj]
+                            [self.converter.marking]
+                            + unique_objects
+                            + [report_obj]
                         )
                         self._send_bundle(work_id, all_objects)
                         self.helper.connector_logger.info(
