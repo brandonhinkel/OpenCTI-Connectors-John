@@ -20,8 +20,9 @@
 #      to the Flashpoint author identity via _floor_relation(). The floor
 #      relationship is the minimum required by the data model.
 #   4. Report types differ by dataset:
-#        Finished intelligence → ["threat-report"]
-#        Alert/communities batch Reports → ["observed-data"]
+#        Finished intelligence → ["activity-roundup"]
+#        Alert batch Reports → ["activity-roundup", "alerts-roundup"]
+#        Communities batch Reports → ["activity-roundup"]
 #
 # DEFAULT TLP: TLP:AMBER+STRICT for all objects from all datasets.
 # Dark web community content and credential data are not public; applying
@@ -295,43 +296,58 @@ class ConverterToStix:
 
     def _ensure_activity_roundup_vocabulary(self) -> None:
         """
-        Register the 'activity-roundup' entry in the report_types_ov vocabulary.
+        Register custom report_types_ov vocabulary entries used by this connector.
 
-        MUST be called before any Report with report_types=["activity-roundup"]
-        is sent. If the vocabulary entry does not exist when a Report is
-        ingested, the OpenCTI worker will reject the report_types field or
-        coerce it to a default value.
+        Entries registered:
+          - 'activity-roundup': applied to all Report containers (finished
+            intelligence, alert batch Reports, communities batch Reports).
+          - 'alerts-roundup': applied in addition to 'activity-roundup' on
+            alert batch Reports only, enabling decay and retention rules to
+            target alert noise independently of finished intelligence.
 
-        helper.api.vocabulary.create() is idempotent — if the entry already
-        exists, the platform returns the existing record without error or
-        creating a duplicate. This makes it safe to call on every connector
-        startup without checking first.
-
-        The call is wrapped in try/except because some OpenCTI versions may
-        raise on duplicate rather than returning the existing record. In that
-        case the warning is logged but startup continues — the vocabulary
-        entry already exists and Reports will be accepted.
+        MUST be called before any Report referencing these types is sent.
+        helper.api.vocabulary.create() is idempotent — safe to call on every
+        startup. Each call is wrapped individually so a failure on one entry
+        does not prevent the other from being registered.
         """
-        try:
-            self.helper.api.vocabulary.create(
-                name="activity-roundup",
-                description=(
+        _entries = [
+            (
+                "activity-roundup",
+                (
                     "Periodic activity summary report covering threat actor "
                     "operations, campaign developments, and intelligence "
-                    "updates over a defined time window. Used for Flashpoint "
-                    "finished intelligence reports and daily batch ingestion."
+                    "updates over a defined time window. Used for all "
+                    "Flashpoint Report containers (finished intelligence, "
+                    "alert batch, and communities batch Reports)."
                 ),
-                category="report_types_ov",
-            )
-            self.helper.connector_logger.info(
-                "[CONVERTER] activity-roundup vocabulary entry confirmed."
-            )
-        except Exception as exc:
-            # Non-fatal — vocabulary likely already exists. Log and continue.
-            self.helper.connector_logger.warning(
-                f"[CONVERTER] activity-roundup vocabulary registration "
-                f"(may already exist): {exc}"
-            )
+            ),
+            (
+                "alerts-roundup",
+                (
+                    "Daily batch Report containing keyword-match alert hits "
+                    "from Flashpoint Ignite alert rules. Applied alongside "
+                    "'activity-roundup' on alert batch Reports to allow "
+                    "independent decay and retention scoping from finished "
+                    "intelligence."
+                ),
+            ),
+        ]
+        for name, description in _entries:
+            try:
+                self.helper.api.vocabulary.create(
+                    name=name,
+                    description=description,
+                    category="report_types_ov",
+                )
+                self.helper.connector_logger.info(
+                    f"[CONVERTER] {name} vocabulary entry confirmed."
+                )
+            except Exception as exc:
+                # Non-fatal — vocabulary likely already exists. Log and continue.
+                self.helper.connector_logger.warning(
+                    f"[CONVERTER] {name} vocabulary registration "
+                    f"(may already exist): {exc}"
+                )
 
     # =========================================================================
     # Core relationship utilities
@@ -761,7 +777,7 @@ class ConverterToStix:
         Convert a Flashpoint finished intelligence report dict into a list
         of STIX objects for bundle creation.
 
-        CONTAINER: stix2.Report with report_types=["threat-report"]
+        CONTAINER: stix2.Report with report_types=["activity-roundup"]
         CONTAINMENT: All knowledge graph objects resolved from tags and actors
                      are members of the Report via object_refs.
 
@@ -844,10 +860,7 @@ class ConverterToStix:
             # re-fetched (e.g. because it was updated on Flashpoint).
             id=Report.generate_id(report["title"], report["posted_at"]),
             name=report["title"],
-            # Finished intelligence reports use threat-report so they can
-            # be scoped separately from raw alert/communities batch Reports
-            # in OpenCTI retention policies.
-            report_types=["threat-report"],
+            report_types=["activity-roundup"],
             published=published,
             # summary is the human-readable abstract. body is the full text
             # stored separately in x_opencti_content.
@@ -1673,7 +1686,7 @@ class ConverterToStix:
         if extra_external_refs:
             ext_refs.extend(extra_external_refs)
 
-        effective_report_types = report_types or ["observed-data"]
+        effective_report_types = report_types or ["activity-roundup"]
         effective_description = description or (
             f"Flashpoint intelligence batch for {date_str}. "
             f"Automatically generated by the Flashpoint connector."

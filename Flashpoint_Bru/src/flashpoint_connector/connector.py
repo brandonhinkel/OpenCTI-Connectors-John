@@ -854,7 +854,7 @@ because the OpenCTI API requires individual calls per object. This is
                         member_objects=unique_objects,
                         confidence=self.config.alert_confidence,
                         extra_external_refs=bucket["ext_refs"],
-                        report_types=["observed-data"],
+                        report_types=["activity-roundup", "alerts-roundup"],
                         description=description,
                         content=html_content,
                     )
@@ -1012,7 +1012,7 @@ because the OpenCTI API requires individual calls per object. This is
                             date_str=date_str,
                             member_objects=unique_objects,
                             confidence=self.config.communities_confidence,
-                            report_types=["observed-data"],
+                            report_types=["activity-roundup"],
                         )
                         all_objects = (
                             [self.converter.marking]

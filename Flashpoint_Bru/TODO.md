@@ -118,16 +118,20 @@ completion message.
 ## ~~P2 — Use distinct `report_types` per dataset for lifecycle management~~ *(DONE)*
 
 **Fix applied:**
-- Finished intelligence reports (`convert_flashpoint_report()`) → `["threat-report"]`
-- Keyword-match alert batch Reports → `["observed-data"]`
-- Communities batch Reports → `["observed-data"]`
+- Finished intelligence reports (`convert_flashpoint_report()`) → `["activity-roundup"]`
+- Keyword-match alert batch Reports → `["activity-roundup", "alerts-roundup"]`
+- Communities batch Reports → `["activity-roundup"]`
 
-`build_daily_report()` now accepts a `report_types` parameter (default `["observed-data"]`).
+`build_daily_report()` now accepts a `report_types` parameter (default `["activity-roundup"]`).
 Both flush sites pass it explicitly.
 
-With distinct types, a retention rule of "delete all `observed-data` Reports from
-Flashpoint older than 90 days" cleanly purges raw alert and communities noise
-without any risk of touching finished intelligence.
+`alerts-roundup` is registered alongside `activity-roundup` in
+`_ensure_activity_roundup_vocabulary()` at connector startup.
+
+With `alerts-roundup` as a dedicated type on alert batch Reports, a retention rule
+scoped to `alerts-roundup` cleanly purges keyword-match noise without touching
+finished intelligence or communities Reports, all of which share only
+`activity-roundup`.
 
 **Priority:** P2 | **Effort:** S
 
@@ -294,6 +298,113 @@ per-alert cost minimal. Triage is a first-pass signal, not a final determination
 
 ---
 
+## P2 — Implement Compromised Credentials dataset
+
+**Status:** Blocked on API documentation. Three stub methods are fully scaffolded
+and ready to implement once the API contract is confirmed.
+
+**Stubs that need implementation:**
+- `src/flashpoint_connector/client_api.py` — `get_credentials()`, line ~370
+- `src/flashpoint_connector/connector.py` — `_import_credentials()`, line ~1051
+- `src/flashpoint_connector/converter_to_stix.py` — `convert_credential_record()`, line ~1548
+
+**Step 1 — Confirm the API contract from `docs.flashpoint.io`**
+
+All of the following must be confirmed before any code can be written:
+
+*Endpoint and transport:*
+- Endpoint path (e.g. `/compromised-credentials/v1/...` or `/cti/v1/credentials/...`)
+- HTTP method (GET vs POST)
+- Authentication: same `Authorization: Bearer` header or different scheme
+- Whether CCMC group membership is required on the API key (README notes this requirement — confirm it applies to this endpoint)
+
+*Date filtering:*
+- Parameter name for the start-date filter (e.g. `created_after`, `since`, `start_date`)
+- Expected format (ISO8601, Unix epoch, or other)
+- Whether the filter applies to discovery date, exposure date, or ingestion date — matters for cursor design
+
+*Pagination:*
+- Style: offset/limit (like `/finished-intelligence/v1/reports`), cursor token (like `/alert-management/v1/notifications`), or page integer (like `/sources/v2/communities`)
+- Response field carrying the next-page token or total count
+
+*Response schema — these fields drive all three implementation sites:*
+
+| Purpose | Field name(s) to confirm |
+|---|---|
+| Record unique ID | e.g. `id`, `_id`, `record_id` — needed for deterministic STIX ID generation |
+| Exposed username / email | e.g. `username`, `email`, `credential` — becomes the User-Account observable `user_id` / `account_login` |
+| Domain of the exposed credential | e.g. `domain`, `email_domain`, extracted from email — drives org-domain bifurcation against `FLASHPOINT_ORG_DOMAINS` |
+| Source type / breach category | e.g. `source_type`, `breach_type` (`stealer_log`, `forum_post`, `marketplace`) — becomes Incident label and description |
+| Discovery / first-seen timestamp | e.g. `created_at`, `discovered_at`, `first_seen` — used as Incident `created`, drives cursor advancement |
+| Source URL (breach location) | e.g. `source_url`, `url` — becomes URL Observable if present |
+| Flashpoint platform URL | e.g. `flashpoint_url`, `platform_url` — ExternalReference + URL Observable linking back to Ignite |
+| Password (if exposed) | e.g. `password` — **do not store as an observable value**; include only as a flag (`password_exposed: true`) in Incident description or label |
+
+**Step 2 — Implement `client_api.get_credentials(start_date)`**
+
+Pattern to follow: `get_alerts()` for cursor pagination or `get_reports()` for offset pagination.
+The method must:
+- Accept `start_date: str` (ISO8601)
+- Page through all results and return a flat `list[dict]`
+- Raise `FlashpointAPIError` (or let `requests` propagate) on HTTP errors — same pattern as other methods
+- Log `[CREDENTIALS] Fetched N records since {start_date}` at info level
+
+**Step 3 — Implement `connector._import_credentials()`**
+
+Pattern to follow: `_import_alerts()` (bifurcation + daily batch bucket logic).
+
+```
+1. Read credentials_last_run cursor (same pattern as other datasets)
+2. records = self.client.get_credentials(start_date)
+3. For each record:
+     domain = record[<domain_field>]
+     if any(d in domain for d in self.config.org_domains):
+         # Org match → IR path
+         objects = self.converter.convert_credential_record(record, is_org=True)
+         ir_name = f"Flashpoint Credential Exposure — {record[<id_field>]}"
+         self.helper.api.case_incident.create(...)
+         send bundle
+     else:
+         # Non-org → accumulate in daily bucket keyed by discovery date
+         date_str = record[<timestamp_field>][:10]
+         cred_buckets[date_str]["objects"].extend(objects)
+4. Flush non-org buckets as daily batch Reports
+     name = f"Flashpoint Compromised Credentials — {date_str}"
+     report_types = ["observed-data"]  (same as alerts/communities)
+5. Advance credentials_last_run cursor to now_iso
+```
+
+Log pattern to emit at completion:
+`[CREDENTIALS] Complete — IR: X, batch: Y, skipped: Z`
+
+**Step 4 — Implement `converter_to_stix.convert_credential_record(record, is_org)`**
+
+Pattern to follow: `credential_alert_to_incident_objects()` (same file, line ~1089) for the IR path.
+
+Objects to create per record:
+
+| Object | Type | Condition |
+|---|---|---|
+| `stix2.Incident` | SDO | `is_org=True` only |
+| `stix2.UserAccount` | SCO | Always — `user_id` = exposed username or email |
+| `stix2.DomainName` | SCO | Always — `value` = domain of exposed credential |
+| `stix2.URL` | SCO | If source URL present in record |
+| `stix2.URL` | SCO | If Flashpoint platform URL present in record |
+| `related-to` relationships | SRO | Each SCO → Incident (IR path) or → Flashpoint author identity (non-org floor) |
+
+Deterministic ID: `stix2.Incident.id = Incident.generate_id(name=ir_name, created=record[<timestamp>])`
+
+**Note on password field:** If the API returns a password value, do **not** create an observable for it. Include a label `password-exposed` on the Incident/Report member and note it in the description. Storing cleartext passwords as observable values creates data-handling risk and violates the instance data model.
+
+**Files:**
+- `src/flashpoint_connector/client_api.py` — `get_credentials()`
+- `src/flashpoint_connector/connector.py` — `_import_credentials()`
+- `src/flashpoint_connector/converter_to_stix.py` — `convert_credential_record()`
+
+**Priority:** P2 | **Effort:** L (API documentation lookup is Step 1; implementation is M once schema is confirmed)
+
+---
+
 ## Summary
 
 | # | Description | Priority | Effort | Status |
@@ -313,3 +424,4 @@ per-alert cost minimal. Triage is a first-pass signal, not a final determination
 | 13 | ~~HTML summary content strategy: per-run section headers (append model)~~ | P2 | M | Done |
 | 14 | AI first-pass triage of keyword-match alerts | P3 | L | Open |
 | 15 | ~~Extract `alert["reason"]["text"]` as `alert_logic` in `_process_alert()`~~ | P2 | S | Done |
+| 16 | Implement Compromised Credentials dataset (blocked on API docs) | P2 | L | Blocked |
