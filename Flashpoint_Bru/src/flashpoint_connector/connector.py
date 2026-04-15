@@ -828,7 +828,7 @@ because the OpenCTI API requires individual calls per object. This is
                             id=report_stix_id
                         )
                         existing_content = (existing or {}).get(
-                            "x_opencti_content"
+                            "content"
                         ) or ""
                     except Exception as exc:
                         self.helper.connector_logger.debug(

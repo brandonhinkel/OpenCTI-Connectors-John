@@ -174,6 +174,103 @@ def _excerpt_highlight(text: str, context: int = 60) -> str:
     return " … ".join(parts)
 
 
+def _excerpt_highlight_html(
+    text: str, context: int = 60, max_marks: int = 5
+) -> str:
+    """
+    Like _excerpt_highlight but returns safe HTML with keyword matches styled
+    in red for visibility on OpenCTI's dark theme.
+
+    Limits output to the first `max_marks` keyword match windows (default 5),
+    each with up to `context` characters of surrounding plain text (default 60),
+    giving ~300 characters of triage content per alert row.
+
+    Marked text is wrapped in <span style="color:#ff6b6b"> so it stands out
+    from surrounding context without requiring custom CSS classes.
+
+    Plain-text portions are HTML-escaped; only the <span> tags are emitted raw.
+
+    :param text: raw text possibly containing <mark>…</mark> markup
+    :param context: chars of plain-text context before/after each marked span
+    :param max_marks: maximum number of mark windows to include in output
+    :return: safe HTML string with colored keyword highlights
+    """
+    if not text:
+        return ""
+
+    # Replace <mark>/<mark> with private-use sentinels, strip remaining HTML.
+    _OPEN = "\x02"
+    _CLOSE = "\x03"
+    tagged = text.replace("<mark>", _OPEN).replace("</mark>", _CLOSE)
+    tagged = _re.sub(r"<[^>]+>", "", tagged)
+
+    # Build plain_chars and a parallel in_mark boolean array.
+    plain_chars: list = []
+    in_mark: list = []
+    mark_ranges: list = []
+    span_start = None
+    currently_marked = False
+
+    for ch in tagged:
+        if ch == _OPEN:
+            span_start = len(plain_chars)
+            currently_marked = True
+        elif ch == _CLOSE:
+            if span_start is not None:
+                mark_ranges.append((span_start, len(plain_chars)))
+                span_start = None
+            currently_marked = False
+        else:
+            plain_chars.append(ch)
+            in_mark.append(currently_marked)
+
+    plain = "".join(plain_chars)
+
+    if not mark_ranges:
+        escaped = _html.escape(plain)
+        return escaped[:300] + ("…" if len(plain) > 300 else "")
+
+    # Limit to the first max_marks matches.
+    mark_ranges = mark_ranges[:max_marks]
+
+    # Build context windows and merge overlapping ones.
+    windows: list = []
+    for ms, me in mark_ranges:
+        ws = max(0, ms - context)
+        we = min(len(plain), me + context)
+        if windows and ws <= windows[-1][1]:
+            windows[-1][1] = max(windows[-1][1], we)
+        else:
+            windows.append([ws, we])
+
+    parts = []
+    for ws, we in windows:
+        html_part = "…" if ws > 0 else ""
+        i = ws
+        while i < we:
+            if in_mark[i]:
+                j = i
+                while j < we and in_mark[j]:
+                    j += 1
+                html_part += (
+                    f'<span style="color:#ff6b6b">'
+                    f'{_html.escape(plain[i:j])}'
+                    f'</span>'
+                )
+                i = j
+            else:
+                j = i
+                while j < we and not in_mark[j]:
+                    j += 1
+                html_part += _html.escape(plain[i:j])
+                i = j
+        if we < len(plain):
+            html_part += "…"
+        parts.append(html_part)
+
+    return " … ".join(parts)
+
+
 # =============================================================================
 # ConverterToStix
 # =============================================================================
@@ -1762,10 +1859,16 @@ class ConverterToStix:
 
             # Show rule logic (search query) if available so analysts can see
             # why the rule fired without leaving the Content tab.
+            # Wrapped in <details> so it is collapsed by default — analysts
+            # can expand it to diagnose why certain alerts matched.
             rule_logic = rule_alerts[0].get("alert_logic") or ""
             if rule_logic:
                 section += (
+                    f'<details>\n'
+                    f'<summary style="cursor:pointer;color:#aaaaaa">'
+                    f'Alert Logic (click to expand)</summary>\n'
                     f'<pre><code>{_html.escape(rule_logic)}</code></pre>\n'
+                    f'</details>\n'
                 )
 
             section += (
@@ -1791,7 +1894,7 @@ class ConverterToStix:
                 highlight = alert.get("highlight_text") or ""
                 # Media alerts have no text — display a placeholder instead.
                 if highlight:
-                    excerpt = _html.escape(_excerpt_highlight(highlight))
+                    excerpt = _excerpt_highlight_html(highlight)
                 else:
                     excerpt = "<em>[media attachment]</em>"
                 url = alert.get("flashpoint_url") or ""
