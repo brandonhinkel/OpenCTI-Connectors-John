@@ -379,6 +379,7 @@ because the OpenCTI API requires individual calls per object. This is
           "communities"    — a dark web forum post matched the alert rule
           "media"          — an image or file matched the alert rule
           "data_exposure"  — content in a code repository matched the rule
+          "marketplaces"   — a dark web marketplace listing matched the rule
 
         Each source type has a slightly different resource structure, so
         field extraction is handled per-source-type.
@@ -388,6 +389,10 @@ because the OpenCTI API requires individual calls per object. This is
         actor alias data and the original content URL:
           communities: fetches site_actor_alias and container_external_uri
           media: fetches storage_uri to enable binary content download
+
+        For "marketplaces", the base dict extraction is sufficient —
+        site.title, title, and site_actor.names.handle map to channel_type,
+        channel_name, and author respectively without additional API calls.
 
         RETURN VALUE:
         Returns a normalised dict with consistent field names regardless of
@@ -493,6 +498,13 @@ because the OpenCTI API requires individual calls per object. This is
                     f"[CONNECTOR] Media fetch for alert {alert_id}: {exc}"
                 )
 
+        elif source == "marketplaces":
+            # Marketplace listing alerts share the same resource structure as
+            # communities (site.title, title, site_actor.names.handle), so the
+            # base dict extraction above is sufficient. No additional API call
+            # or field remapping is required.
+            pass
+
         elif source.startswith("data_exposure"):
             # data_exposure alerts reference a code repository or paste site.
             # The resource structure differs from communities/media:
@@ -515,7 +527,7 @@ because the OpenCTI API requires individual calls per object. This is
             self.helper.connector_logger.warning(
                 f"[CONNECTOR] Unrecognised alert source type '{source}' "
                 f"for alert {alert_id}. "
-                f"Supported types: communities, media, data_exposure*. "
+                f"Supported types: communities, media, marketplaces, data_exposure*. "
                 f"Skipping this alert."
             )
             return None
